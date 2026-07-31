@@ -9,10 +9,12 @@ Suporta interrupcao: falar enquanto a IA esta respondendo corta a fala dela na h
 
 import asyncio
 import audioop
+import json
 import re
 import tempfile
 import threading
 import os
+import unicodedata
 
 import pyaudio
 import torch
@@ -33,6 +35,9 @@ VAD_FRAMES_CONSECUTIVOS = 4  # frames seguidos de fala pra confirmar interrupcao
 VAD_TAMANHO_FRAME = 512  # amostras por frame, exigido pelo Silero VAD em 16kHz
 MULTIPLICADOR_VOLUME_INTERRUPCAO = 3.0  # volume minimo (x limiar de ruido ambiente) pra contar como voce falando de perto
 NUM_PREDICT = 1024  # limite de tokens da resposta
+
+CAMINHO_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+FRASES_PARAR = ["pare de ouvir", "pode dormir", "para de escutar", "para de ouvir"]
 
 SYSTEM_PROMPT = (
     "Voce e um assistente de voz. Converse normalmente sobre qualquer assunto "
@@ -63,6 +68,56 @@ def _achar_indice_microfone(trecho_nome):
         if trecho_nome.lower() in nome.lower():
             return indice
     return None
+
+
+def _normalizar(texto):
+    """Minusculas e sem acento, pra comparar frases faladas com mais tolerancia."""
+    sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    return sem_acento.lower().strip()
+
+
+def _carregar_ou_criar_config(recognizer, microfone):
+    if os.path.exists(CAMINHO_CONFIG):
+        with open(CAMINHO_CONFIG, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        if config.get("nome_assistente"):
+            return config
+
+    print("Primeira vez rodando o assistente. Vamos dar um nome pra ela por voz.")
+    falar_curto("Ola! Ainda nao tenho um nome. Diga, em uma palavra so, o nome que voce quer me dar.")
+
+    nome = ""
+    while not nome:
+        with microfone as source:
+            print("Ouvindo o nome...")
+            audio = recognizer.listen(source, timeout=15, phrase_time_limit=10)
+        texto = recognizer.recognize_whisper(
+            audio,
+            model=WHISPER_MODEL,
+            language=LANGUAGE,
+            load_options={"device": WHISPER_DEVICE},
+        ).strip()
+        nome = texto.strip(" .,!?").split()[0].capitalize() if texto.strip() else ""
+        if not nome:
+            falar_curto("Nao entendi, pode repetir o nome?")
+
+    config = {"nome_assistente": nome}
+    with open(CAMINHO_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    falar_curto(f"Combinado! Pode me chamar de {nome} a partir de agora.")
+    return config
+
+
+def _extrair_comando_apos_palavra_chave(texto, palavra_chave):
+    """Se a palavra-chave aparece no texto, devolve o que vier depois dela
+    (o comando). Se a palavra-chave nao aparece, devolve None."""
+    texto_normalizado = _normalizar(texto)
+    chave_normalizada = _normalizar(palavra_chave)
+    pos = texto_normalizado.find(chave_normalizada)
+    if pos == -1:
+        return None
+    resto = texto[pos + len(chave_normalizada):].strip(" ,.:;!?-")
+    return resto
 
 
 def _limpar_para_fala(texto):
@@ -99,6 +154,25 @@ def _extrair_blocos_prontos(buffer):
 async def _sintetizar(texto, caminho):
     comunicador = edge_tts.Communicate(texto, VOICE)
     await comunicador.save(caminho)
+
+
+async def _falar_curto_async(texto):
+    """Fala uma frase curta de confirmacao, sem streaming nem interrupcao
+    (usado para 'oi, pode falar' e 'ok, vou dormir')."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+        caminho = f.name
+    await _sintetizar(texto, caminho)
+    pygame.mixer.music.load(caminho)
+    pygame.mixer.music.play()
+    while pygame.mixer.music.get_busy():
+        await asyncio.sleep(0.05)
+    pygame.mixer.music.unload()
+    os.remove(caminho)
+
+
+def falar_curto(texto):
+    print(f"Assistente: {texto}")
+    asyncio.run(_falar_curto_async(texto))
 
 
 class MonitorInterrupcao:
@@ -275,6 +349,7 @@ def responder_e_falar(historico, indice_mic, limiar_volume):
 
 def main():
     pygame.mixer.init()
+
     recognizer = sr.Recognizer()
     recognizer.pause_threshold = 2.0  # segundos de silencio para considerar que a frase acabou
     recognizer.non_speaking_duration = 0.5
@@ -296,12 +371,16 @@ def main():
     print(f"Limiar de energia calibrado: {recognizer.energy_threshold:.0f}")
     limiar_volume_interrupcao = recognizer.energy_threshold * MULTIPLICADOR_VOLUME_INTERRUPCAO
 
-    print("Pronto! Pode falar quando quiser (Ctrl+C para sair). Pode interromper a fala dela a qualquer momento.\n")
+    config = _carregar_ou_criar_config(recognizer, microfone)
+    nome_assistente = config["nome_assistente"]
+
+    modo = "dormindo"
+    print(f'\nPronto! Diga "{nome_assistente}" pra ativar. (Ctrl+C para sair)\n')
 
     while True:
         try:
             with microfone as source:
-                print("Ouvindo...")
+                print("Ouvindo..." if modo == "ativo" else f'Esperando "{nome_assistente}"...')
                 audio = recognizer.listen(source, timeout=15, phrase_time_limit=20)
 
             print("Transcrevendo...")
@@ -315,7 +394,25 @@ def main():
             if not texto_usuario:
                 continue
 
+            if modo == "dormindo":
+                comando = _extrair_comando_apos_palavra_chave(texto_usuario, nome_assistente)
+                if comando is None:
+                    print(f'(ouvido: "{texto_usuario}" - nao reconheci o nome "{nome_assistente}")')
+                    continue  # nao disse o nome, ignora e continua dormindo
+
+                modo = "ativo"
+                if not comando:
+                    falar_curto("Oi, pode falar.")
+                    continue
+                texto_usuario = comando
+
             print(f"Voce: {texto_usuario}")
+
+            if any(frase in _normalizar(texto_usuario) for frase in FRASES_PARAR):
+                falar_curto("Ok, pode me chamar quando precisar.")
+                modo = "dormindo"
+                continue
+
             historico.append({"role": "user", "content": texto_usuario})
 
             texto_resposta, interrompido = responder_e_falar(
