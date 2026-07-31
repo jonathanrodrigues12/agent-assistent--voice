@@ -110,7 +110,14 @@ SYSTEM_PROMPT = (
     "tecnicos quando fizer sentido, mas evite listas numeradas, formatacao "
     "markdown e blocos de codigo, ja que a resposta sera lida em voz alta - "
     "descreva o codigo em palavras em vez de escreve-lo literalmente. "
-    "Nunca use emojis ou emoticons em nenhuma resposta."
+    "Nunca use emojis ou emoticons em nenhuma resposta. "
+    "Quando o usuario pedir pra voce escrever, redigir ou criar algo (uma "
+    "mensagem, um texto, um resumo, etc.), NAO fique so perguntando detalhes "
+    "antes de comecar. Em vez disso, ja produza uma primeira versao completa "
+    "usando o contexto que voce tem, mesmo que precise assumir alguma coisa "
+    "razoavel. Depois de entregar essa primeira versao, pergunte se quer "
+    "ajustar algo. So peca esclarecimento antes de comecar se for realmente "
+    "impossivel prosseguir sem essa informacao."
 )
 
 TAMANHO_MINIMO_BLOCO = 80  # caracteres; agrupa frases curtas pra evitar pausas artificiais
@@ -148,8 +155,17 @@ def transcrever(audio_data):
     modelo = _carregar_modelo_whisper()
     dados_brutos = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
     amostras = np.frombuffer(dados_brutos, dtype=np.int16).astype(np.float32) / 32768.0
+
+    # padding de silencio no inicio/fim: melhora bastante a precisao do
+    # Whisper em gravacoes curtas (palavras/comandos de uma so palavra)
+    padding = np.zeros(int(16000 * 0.3), dtype=np.float32)
+    amostras = np.concatenate([padding, amostras, padding])
+
     resultado = modelo.transcribe(
-        amostras, language=LANGUAGE, fp16=(WHISPER_DEVICE == "cuda")
+        amostras,
+        language=LANGUAGE,
+        fp16=(WHISPER_DEVICE == "cuda"),
+        beam_size=5,
     )
     return resultado["text"].strip()
 
