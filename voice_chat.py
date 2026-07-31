@@ -15,9 +15,12 @@ import tempfile
 import threading
 import os
 import unicodedata
+from difflib import SequenceMatcher
 
+import numpy as np
 import pyaudio
 import torch
+import whisper
 import speech_recognition as sr
 import edge_tts
 import pygame
@@ -37,7 +40,20 @@ MULTIPLICADOR_VOLUME_INTERRUPCAO = 3.0  # volume minimo (x limiar de ruido ambie
 NUM_PREDICT = 1024  # limite de tokens da resposta
 
 CAMINHO_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-FRASES_PARAR = ["pare de ouvir", "pode dormir", "para de escutar", "para de ouvir"]
+FRASES_PARAR = [
+    "pare de ouvir",
+    "pode dormir",
+    "para de escutar",
+    "para de ouvir",
+    "obrigado",
+    "obrigada",
+    "pare",
+    "parar",
+    "pode parar",
+    "chega",
+    "silencio",
+]
+LIMIAR_SIMILARIDADE_NOME = 0.55  # 0-1; quanto menor, mais tolerante a erros de transcricao do nome
 
 SYSTEM_PROMPT = (
     "Voce e um assistente de voz. Converse normalmente sobre qualquer assunto "
@@ -70,6 +86,30 @@ def _achar_indice_microfone(trecho_nome):
     return None
 
 
+_modelo_whisper = None
+
+
+def _carregar_modelo_whisper():
+    global _modelo_whisper
+    if _modelo_whisper is None:
+        print("Carregando modelo Whisper...")
+        _modelo_whisper = whisper.load_model(WHISPER_MODEL, device=WHISPER_DEVICE)
+    return _modelo_whisper
+
+
+def transcrever(audio_data):
+    """Transcreve um sr.AudioData chamando o whisper direto, com o modelo
+    ja carregado em memoria (a wrapper do speech_recognition recarrega o
+    modelo do zero a cada chamada, o que deixava tudo muito lento)."""
+    modelo = _carregar_modelo_whisper()
+    dados_brutos = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
+    amostras = np.frombuffer(dados_brutos, dtype=np.int16).astype(np.float32) / 32768.0
+    resultado = modelo.transcribe(
+        amostras, language=LANGUAGE, fp16=(WHISPER_DEVICE == "cuda")
+    )
+    return resultado["text"].strip()
+
+
 def _normalizar(texto):
     """Minusculas e sem acento, pra comparar frases faladas com mais tolerancia."""
     sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
@@ -91,12 +131,7 @@ def _carregar_ou_criar_config(recognizer, microfone):
         with microfone as source:
             print("Ouvindo o nome...")
             audio = recognizer.listen(source, timeout=15, phrase_time_limit=10)
-        texto = recognizer.recognize_whisper(
-            audio,
-            model=WHISPER_MODEL,
-            language=LANGUAGE,
-            load_options={"device": WHISPER_DEVICE},
-        ).strip()
+        texto = transcrever(audio)
         nome = texto.strip(" .,!?").split()[0].capitalize() if texto.strip() else ""
         if not nome:
             falar_curto("Nao entendi, pode repetir o nome?")
@@ -108,16 +143,37 @@ def _carregar_ou_criar_config(recognizer, microfone):
     return config
 
 
+def _similaridade(a, b):
+    return SequenceMatcher(None, a, b).ratio()
+
+
 def _extrair_comando_apos_palavra_chave(texto, palavra_chave):
-    """Se a palavra-chave aparece no texto, devolve o que vier depois dela
-    (o comando). Se a palavra-chave nao aparece, devolve None."""
-    texto_normalizado = _normalizar(texto)
+    """Procura a palavra-chave no texto por aproximacao (o Whisper erra
+    nomes curtos com frequencia, ex: 'Zoe' pode sair como 'Zoi' ou 'Zule').
+    Se achar uma palavra parecida o suficiente, devolve o que vier depois
+    dela (o comando). Se nao achar nada parecido, devolve None."""
     chave_normalizada = _normalizar(palavra_chave)
-    pos = texto_normalizado.find(chave_normalizada)
-    if pos == -1:
-        return None
-    resto = texto[pos + len(chave_normalizada):].strip(" ,.:;!?-")
-    return resto
+    palavras = texto.split()
+
+    for i, palavra in enumerate(palavras):
+        palavra_limpa = re.sub(r"[^\w]", "", _normalizar(palavra))
+        if not palavra_limpa:
+            continue
+        if _similaridade(palavra_limpa, chave_normalizada) >= LIMIAR_SIMILARIDADE_NOME:
+            resto = " ".join(palavras[i + 1:]).strip(" ,.:;!?-")
+            return resto
+
+    return None
+
+
+PADROES_PARAR = [
+    re.compile(r"\b" + re.escape(_normalizar(frase)) + r"\b") for frase in FRASES_PARAR
+]
+
+
+def _contem_frase_de_parar(texto):
+    texto_normalizado = _normalizar(texto)
+    return any(padrao.search(texto_normalizado) for padrao in PADROES_PARAR)
 
 
 def _limpar_para_fala(texto):
@@ -349,6 +405,7 @@ def responder_e_falar(historico, indice_mic, limiar_volume):
 
 def main():
     pygame.mixer.init()
+    _carregar_modelo_whisper()
 
     recognizer = sr.Recognizer()
     recognizer.pause_threshold = 2.0  # segundos de silencio para considerar que a frase acabou
@@ -384,12 +441,7 @@ def main():
                 audio = recognizer.listen(source, timeout=15, phrase_time_limit=20)
 
             print("Transcrevendo...")
-            texto_usuario = recognizer.recognize_whisper(
-                audio,
-                model=WHISPER_MODEL,
-                language=LANGUAGE,
-                load_options={"device": WHISPER_DEVICE},
-            ).strip()
+            texto_usuario = transcrever(audio)
 
             if not texto_usuario:
                 continue
@@ -408,7 +460,7 @@ def main():
 
             print(f"Voce: {texto_usuario}")
 
-            if any(frase in _normalizar(texto_usuario) for frase in FRASES_PARAR):
+            if _contem_frase_de_parar(texto_usuario):
                 falar_curto("Ok, pode me chamar quando precisar.")
                 modo = "dormindo"
                 continue
