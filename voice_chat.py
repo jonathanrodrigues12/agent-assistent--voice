@@ -8,6 +8,7 @@ Suporta interrupcao: falar enquanto a IA esta respondendo corta a fala dela na h
 """
 
 import asyncio
+import audioop
 import re
 import tempfile
 import threading
@@ -30,6 +31,7 @@ NOME_MICROFONE = "fifine"  # trecho do nome do microfone a ser usado (ver lista 
 VAD_LIMIAR = 0.6  # confianca minima (0-1) de que e fala humana, nao ruido
 VAD_FRAMES_CONSECUTIVOS = 4  # frames seguidos de fala pra confirmar interrupcao (evita falso positivo)
 VAD_TAMANHO_FRAME = 512  # amostras por frame, exigido pelo Silero VAD em 16kHz
+MULTIPLICADOR_VOLUME_INTERRUPCAO = 3.0  # volume minimo (x limiar de ruido ambiente) pra contar como voce falando de perto
 NUM_PREDICT = 1024  # limite de tokens da resposta
 
 SYSTEM_PROMPT = (
@@ -101,13 +103,16 @@ async def _sintetizar(texto, caminho):
 
 class MonitorInterrupcao:
     """Escuta o microfone em uma thread separada enquanto a IA fala.
-    Usa o Silero VAD (deteccao de voz humana) para so interromper quando
-    alguem realmente esta falando, ignorando ruidos como latidos, batidas, etc."""
+    So interrompe quando dois sinais batem ao mesmo tempo: o Silero VAD
+    confirma que e voz humana (nao ruido tipo latido, batida) E o volume
+    esta alto o suficiente pra ser alguem falando perto do microfone
+    (filtra conversas ao fundo, que chegam mais baixas)."""
 
     _modelo_vad = None
 
-    def __init__(self, indice_mic):
+    def __init__(self, indice_mic, limiar_volume):
         self.indice_mic = indice_mic
+        self.limiar_volume = limiar_volume
         self.evento_interrupcao = threading.Event()
         self._evento_parar = threading.Event()
         self._thread = None
@@ -131,6 +136,12 @@ class MonitorInterrupcao:
         try:
             while not self._evento_parar.is_set():
                 dados = stream.read(VAD_TAMANHO_FRAME, exception_on_overflow=False)
+
+                rms = audioop.rms(dados, 2)
+                if rms < self.limiar_volume:
+                    frames_seguidos = 0
+                    continue
+
                 amostras = torch.frombuffer(bytearray(dados), dtype=torch.int16).float() / 32768.0
                 with torch.no_grad():
                     probabilidade = modelo(amostras, 16000).item()
@@ -157,8 +168,8 @@ class MonitorInterrupcao:
             self._thread.join(timeout=1)
 
 
-async def _tocar(caminho, indice_mic):
-    monitor = MonitorInterrupcao(indice_mic)
+async def _tocar(caminho, indice_mic, limiar_volume):
+    monitor = MonitorInterrupcao(indice_mic, limiar_volume)
     monitor.iniciar()
 
     pygame.mixer.music.load(caminho)
@@ -205,7 +216,7 @@ async def _tokens_ollama(historico):
         yield pedaco["message"]["content"]
 
 
-async def _responder_e_falar(historico, indice_mic):
+async def _responder_e_falar(historico, indice_mic, limiar_volume):
     """Consome a resposta do Ollama em streaming, sintetizando e falando
     cada frase assim que ela fica pronta, em paralelo com a geracao do resto."""
     fila = asyncio.Queue(maxsize=2)
@@ -242,7 +253,7 @@ async def _responder_e_falar(historico, indice_mic):
             if item is None:
                 break
             caminho, frase_limpa = item
-            interrompido = await _tocar(caminho, indice_mic)
+            interrompido = await _tocar(caminho, indice_mic, limiar_volume)
             os.remove(caminho)
             if not interrompido:
                 texto_falado.append(frase_limpa)
@@ -258,8 +269,8 @@ async def _responder_e_falar(historico, indice_mic):
     return " ".join(texto_falado).strip(), interrompido
 
 
-def responder_e_falar(historico, indice_mic):
-    return asyncio.run(_responder_e_falar(historico, indice_mic))
+def responder_e_falar(historico, indice_mic, limiar_volume):
+    return asyncio.run(_responder_e_falar(historico, indice_mic, limiar_volume))
 
 
 def main():
@@ -283,6 +294,7 @@ def main():
     with microfone as source:
         recognizer.adjust_for_ambient_noise(source, duration=1.5)
     print(f"Limiar de energia calibrado: {recognizer.energy_threshold:.0f}")
+    limiar_volume_interrupcao = recognizer.energy_threshold * MULTIPLICADOR_VOLUME_INTERRUPCAO
 
     print("Pronto! Pode falar quando quiser (Ctrl+C para sair). Pode interromper a fala dela a qualquer momento.\n")
 
@@ -306,7 +318,9 @@ def main():
             print(f"Voce: {texto_usuario}")
             historico.append({"role": "user", "content": texto_usuario})
 
-            texto_resposta, interrompido = responder_e_falar(historico, indice_mic)
+            texto_resposta, interrompido = responder_e_falar(
+                historico, indice_mic, limiar_volume_interrupcao
+            )
             historico.append({"role": "assistant", "content": texto_resposta})
             if interrompido:
                 print("(interrompido)")
