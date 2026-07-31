@@ -47,6 +47,7 @@ SYSTEM_PROMPT = (
 )
 
 TAMANHO_MINIMO_BLOCO = 80  # caracteres; agrupa frases curtas pra evitar pausas artificiais
+TAMANHO_MAXIMO_BLOCO = 220  # forca quebra mesmo sem pontuacao, pra nao acumular o texto todo
 PADRAO_FIM_DE_FRASE = re.compile(r"(?<=[.!?])\s+")
 PADRAO_EMOJI = re.compile(
     r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF]"
@@ -66,6 +67,31 @@ def _limpar_para_fala(texto):
     texto = PADRAO_EMOJI.sub("", texto)
     texto = PADRAO_MARKDOWN.sub("", texto)
     return texto.strip()
+
+
+def _extrair_blocos_prontos(buffer):
+    """Retira do buffer os trechos ja prontos pra falar: por pontuacao de fim
+    de frase, ou por tamanho maximo (forca quebra mesmo sem pontuacao, pra
+    nao acumular o texto inteiro esperando um ponto final)."""
+    blocos = []
+    while True:
+        m = PADRAO_FIM_DE_FRASE.search(buffer)
+        if m and len(buffer[: m.start() + 1]) >= TAMANHO_MINIMO_BLOCO:
+            blocos.append(buffer[: m.end()])
+            buffer = buffer[m.end():]
+            continue
+
+        if len(buffer) >= TAMANHO_MAXIMO_BLOCO:
+            pos_corte = buffer.rfind(" ", 0, TAMANHO_MAXIMO_BLOCO)
+            if pos_corte <= 0:
+                pos_corte = TAMANHO_MAXIMO_BLOCO
+            blocos.append(buffer[:pos_corte])
+            buffer = buffer[pos_corte:].lstrip()
+            continue
+
+        break
+
+    return blocos, buffer
 
 
 async def _sintetizar(texto, caminho):
@@ -183,44 +209,43 @@ async def _responder_e_falar(historico, indice_mic):
     """Consome a resposta do Ollama em streaming, sintetizando e falando
     cada frase assim que ela fica pronta, em paralelo com a geracao do resto."""
     fila = asyncio.Queue(maxsize=2)
-    texto_completo = []
 
     async def produtor():
         buffer = ""
         print("Assistente: ", end="", flush=True)
         async for pedaco in _tokens_ollama(historico):
             print(pedaco, end="", flush=True)
-            texto_completo.append(pedaco)
             buffer += pedaco
-            while True:
-                m = PADRAO_FIM_DE_FRASE.search(buffer)
-                if not m or len(buffer[: m.start() + 1]) < TAMANHO_MINIMO_BLOCO:
-                    break
-                frase, buffer = buffer[: m.end()], buffer[m.end():]
-                frase_limpa = _limpar_para_fala(frase)
+            blocos, buffer = _extrair_blocos_prontos(buffer)
+            for bloco in blocos:
+                frase_limpa = _limpar_para_fala(bloco)
                 if frase_limpa:
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                         caminho = f.name
                     await _sintetizar(frase_limpa, caminho)
-                    await fila.put(caminho)
+                    await fila.put((caminho, frase_limpa))
         print()
         frase_limpa = _limpar_para_fala(buffer)
         if frase_limpa:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 caminho = f.name
             await _sintetizar(frase_limpa, caminho)
-            await fila.put(caminho)
+            await fila.put((caminho, frase_limpa))
         await fila.put(None)
 
     tarefa_produtor = asyncio.create_task(produtor())
     interrompido = False
+    texto_falado = []
     try:
         while True:
-            caminho = await fila.get()
-            if caminho is None:
+            item = await fila.get()
+            if item is None:
                 break
+            caminho, frase_limpa = item
             interrompido = await _tocar(caminho, indice_mic)
             os.remove(caminho)
+            if not interrompido:
+                texto_falado.append(frase_limpa)
             if interrompido:
                 break
     finally:
@@ -230,7 +255,7 @@ async def _responder_e_falar(historico, indice_mic):
         except (asyncio.CancelledError, Exception):
             pass
 
-    return "".join(texto_completo).strip(), interrompido
+    return " ".join(texto_falado).strip(), interrompido
 
 
 def responder_e_falar(historico, indice_mic):
