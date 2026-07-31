@@ -24,8 +24,52 @@ import whisper
 import speech_recognition as sr
 import edge_tts
 import pygame
+import pygame.sndarray
 import ollama
 from silero_vad import load_silero_vad
+
+from ui_visual import PainelVisual
+
+_painel = None
+_som_carregamento = None
+_canal_carregamento = None
+
+
+def _definir_estado_visual(estado):
+    if _painel is not None:
+        _painel.definir_estado(estado)
+
+
+def _gerar_som_carregamento():
+    taxa = 44100
+    duracao_som = 0.12
+    duracao_silencio = 0.35
+    freq = 523.25  # C5, som suave e curto
+
+    t_som = np.linspace(0, duracao_som, int(taxa * duracao_som), False)
+    envelope = np.sin(np.pi * t_som / duracao_som)  # fade in/out, evita clique
+    onda = np.sin(2 * np.pi * freq * t_som) * envelope * 0.15  # volume baixo
+    silencio = np.zeros(int(taxa * duracao_silencio))
+
+    amostra = np.concatenate([onda, silencio])
+    amostra_int16 = (amostra * 32767).astype(np.int16)
+    estereo = np.column_stack([amostra_int16, amostra_int16])
+    return pygame.sndarray.make_sound(estereo)
+
+
+def _iniciar_som_carregamento():
+    global _som_carregamento, _canal_carregamento
+    if _som_carregamento is None:
+        _som_carregamento = _gerar_som_carregamento()
+    _canal_carregamento = _som_carregamento.play(loops=-1)
+
+
+def _parar_som_carregamento():
+    global _canal_carregamento
+    if _canal_carregamento is not None:
+        _canal_carregamento.stop()
+        _canal_carregamento = None
+
 
 MODEL = "qwen3:8b"
 WHISPER_MODEL = "small"  # tiny, base, small, medium (maior = mais preciso, mais lento)
@@ -128,6 +172,7 @@ def _carregar_ou_criar_config(recognizer, microfone):
 
     nome = ""
     while not nome:
+        _definir_estado_visual("ouvindo")
         with microfone as source:
             print("Ouvindo o nome...")
             audio = recognizer.listen(source, timeout=15, phrase_time_limit=10)
@@ -228,6 +273,7 @@ async def _falar_curto_async(texto):
 
 def falar_curto(texto):
     print(f"Assistente: {texto}")
+    _definir_estado_visual("falando")
     asyncio.run(_falar_curto_async(texto))
 
 
@@ -246,8 +292,17 @@ class MonitorInterrupcao:
         self.evento_interrupcao = threading.Event()
         self._evento_parar = threading.Event()
         self._thread = None
+        self.audio_capturado = None
         if MonitorInterrupcao._modelo_vad is None:
             MonitorInterrupcao._modelo_vad = load_silero_vad()
+
+    def _probabilidade_fala(self, modelo, dados):
+        rms = audioop.rms(dados, 2)
+        if rms < self.limiar_volume:
+            return 0.0
+        amostras = torch.frombuffer(bytearray(dados), dtype=torch.int16).float() / 32768.0
+        with torch.no_grad():
+            return modelo(amostras, 16000).item()
 
     def _loop(self):
         modelo = MonitorInterrupcao._modelo_vad
@@ -262,27 +317,43 @@ class MonitorInterrupcao:
             input_device_index=self.indice_mic,
             frames_per_buffer=VAD_TAMANHO_FRAME,
         )
-        frames_seguidos = 0
         try:
+            # fase 1: espera confirmar que e voce falando (nao ruido/fundo)
+            frames_seguidos = 0
+            buffer_captura = bytearray()
             while not self._evento_parar.is_set():
                 dados = stream.read(VAD_TAMANHO_FRAME, exception_on_overflow=False)
-
-                rms = audioop.rms(dados, 2)
-                if rms < self.limiar_volume:
-                    frames_seguidos = 0
-                    continue
-
-                amostras = torch.frombuffer(bytearray(dados), dtype=torch.int16).float() / 32768.0
-                with torch.no_grad():
-                    probabilidade = modelo(amostras, 16000).item()
+                probabilidade = self._probabilidade_fala(modelo, dados)
 
                 if probabilidade > VAD_LIMIAR:
+                    buffer_captura.extend(dados)
                     frames_seguidos += 1
                     if frames_seguidos >= VAD_FRAMES_CONSECUTIVOS:
                         self.evento_interrupcao.set()
                         break
                 else:
                     frames_seguidos = 0
+                    buffer_captura.clear()
+
+            if not self.evento_interrupcao.is_set():
+                return
+
+            # fase 2: continua gravando ate voce parar de falar (ou estourar o tempo maximo)
+            frames_silencio = 0
+            frames_silencio_necessarios = int(1.2 * 16000 / VAD_TAMANHO_FRAME)
+            max_frames = int(20 * 16000 / VAD_TAMANHO_FRAME)  # limite de seguranca: 20s
+            for _ in range(max_frames):
+                dados = stream.read(VAD_TAMANHO_FRAME, exception_on_overflow=False)
+                buffer_captura.extend(dados)
+                probabilidade = self._probabilidade_fala(modelo, dados)
+                if probabilidade > VAD_LIMIAR:
+                    frames_silencio = 0
+                else:
+                    frames_silencio += 1
+                    if frames_silencio >= frames_silencio_necessarios:
+                        break
+
+            self.audio_capturado = bytes(buffer_captura)
         finally:
             stream.stop_stream()
             stream.close()
@@ -299,22 +370,32 @@ class MonitorInterrupcao:
 
 
 async def _tocar(caminho, indice_mic, limiar_volume):
+    """Toca um trecho de audio. Se for interrompido, espera o monitor
+    terminar de capturar o que a pessoa esta falando e devolve esse audio
+    junto, pra nao precisar pedir pra repetir."""
     monitor = MonitorInterrupcao(indice_mic, limiar_volume)
     monitor.iniciar()
 
+    interrompido = False
     pygame.mixer.music.load(caminho)
     pygame.mixer.music.play()
     try:
         while pygame.mixer.music.get_busy():
             if monitor.evento_interrupcao.is_set():
                 pygame.mixer.music.stop()
-                return True
+                interrompido = True
+                break
             await asyncio.sleep(0.05)
     finally:
         pygame.mixer.music.unload()
-        monitor.parar()
 
-    return False
+    if interrompido:
+        while monitor._thread.is_alive():
+            await asyncio.sleep(0.05)
+        return True, monitor.audio_capturado
+
+    monitor.parar()
+    return False, None
 
 
 async def _tokens_ollama(historico):
@@ -349,6 +430,8 @@ async def _tokens_ollama(historico):
 async def _responder_e_falar(historico, indice_mic, limiar_volume):
     """Consome a resposta do Ollama em streaming, sintetizando e falando
     cada frase assim que ela fica pronta, em paralelo com a geracao do resto."""
+    _definir_estado_visual("pensando")
+    _iniciar_som_carregamento()
     fila = asyncio.Queue(maxsize=2)
 
     async def produtor():
@@ -376,6 +459,8 @@ async def _responder_e_falar(historico, indice_mic, limiar_volume):
 
     tarefa_produtor = asyncio.create_task(produtor())
     interrompido = False
+    audio_capturado = None
+    primeiro_audio = True
     texto_falado = []
     try:
         while True:
@@ -383,20 +468,25 @@ async def _responder_e_falar(historico, indice_mic, limiar_volume):
             if item is None:
                 break
             caminho, frase_limpa = item
-            interrompido = await _tocar(caminho, indice_mic, limiar_volume)
+            if primeiro_audio:
+                _parar_som_carregamento()
+                _definir_estado_visual("falando")
+                primeiro_audio = False
+            interrompido, audio_capturado = await _tocar(caminho, indice_mic, limiar_volume)
             os.remove(caminho)
             if not interrompido:
                 texto_falado.append(frase_limpa)
             if interrompido:
                 break
     finally:
+        _parar_som_carregamento()
         tarefa_produtor.cancel()
         try:
             await tarefa_produtor
         except (asyncio.CancelledError, Exception):
             pass
 
-    return " ".join(texto_falado).strip(), interrompido
+    return " ".join(texto_falado).strip(), interrompido, audio_capturado
 
 
 def responder_e_falar(historico, indice_mic, limiar_volume):
@@ -404,7 +494,10 @@ def responder_e_falar(historico, indice_mic, limiar_volume):
 
 
 def main():
+    global _painel
     pygame.mixer.init()
+    _painel = PainelVisual("Assistente de Voz")
+    _painel.iniciar()
     _carregar_modelo_whisper()
 
     recognizer = sr.Recognizer()
@@ -432,13 +525,19 @@ def main():
     nome_assistente = config["nome_assistente"]
 
     modo = "dormindo"
+    audio_pendente = None
     print(f'\nPronto! Diga "{nome_assistente}" pra ativar. (Ctrl+C para sair)\n')
 
     while True:
         try:
-            with microfone as source:
-                print("Ouvindo..." if modo == "ativo" else f'Esperando "{nome_assistente}"...')
-                audio = recognizer.listen(source, timeout=15, phrase_time_limit=20)
+            if audio_pendente is not None:
+                audio = audio_pendente
+                audio_pendente = None
+            else:
+                _definir_estado_visual("ouvindo" if modo == "ativo" else "dormindo")
+                with microfone as source:
+                    print("Ouvindo..." if modo == "ativo" else f'Esperando "{nome_assistente}"...')
+                    audio = recognizer.listen(source, timeout=15, phrase_time_limit=20)
 
             print("Transcrevendo...")
             texto_usuario = transcrever(audio)
@@ -467,12 +566,14 @@ def main():
 
             historico.append({"role": "user", "content": texto_usuario})
 
-            texto_resposta, interrompido = responder_e_falar(
+            texto_resposta, interrompido, audio_capturado = responder_e_falar(
                 historico, indice_mic, limiar_volume_interrupcao
             )
             historico.append({"role": "assistant", "content": texto_resposta})
             if interrompido:
                 print("(interrompido)")
+                if audio_capturado:
+                    audio_pendente = sr.AudioData(audio_capturado, 16000, 2)
 
         except sr.UnknownValueError:
             continue

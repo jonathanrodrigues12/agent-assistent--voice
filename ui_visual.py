@@ -25,13 +25,15 @@ CORES_ONDA = [
     (124, 92, 191),   # roxo
 ]
 COR_OUVINDO = (79, 168, 216)
+COR_CARREGANDO = (200, 200, 210)
 
 NUM_RAIOS = 64
+NUM_PONTOS_CARREGANDO = 8
 
 
 class PainelVisual:
     def __init__(self, titulo="Assistente"):
-        self._estado = "dormindo"  # dormindo | ouvindo | falando
+        self._estado = "dormindo"  # dormindo | ouvindo | pensando | falando
         self._lock = threading.Lock()
         self._rodando = threading.Event()
         self._rodando.set()
@@ -53,7 +55,7 @@ class PainelVisual:
         self._rodando.clear()
 
     def _loop(self):
-        pygame.init()
+        pygame.display.init()
         tela = pygame.display.set_mode((LARGURA, ALTURA))
         pygame.display.set_caption(self._titulo)
         relogio = pygame.time.Clock()
@@ -75,17 +77,22 @@ class PainelVisual:
             elif estado == "ouvindo":
                 self._desenhar_ondas(tela, t, fases, intensidade=0.35, cor_unica=COR_OUVINDO)
                 raio_anel = RAIO_BASE + 4 * math.sin(t * 3)
+            elif estado == "pensando":
+                raio_anel = RAIO_BASE
             else:
                 raio_anel = RAIO_BASE + 5 * math.sin(t * 1.2)
 
             pygame.draw.circle(tela, COR_ANEL, CENTRO, int(raio_anel))
             pygame.draw.circle(tela, COR_ANEL_BORDA, CENTRO, int(raio_anel), width=3)
 
+            if estado == "pensando":
+                self._desenhar_carregando(tela, t)
+
             pygame.display.flip()
             dt = relogio.tick(60) / 1000.0
             t += dt
 
-        pygame.quit()
+        pygame.display.quit()
 
     def _desenhar_ondas(self, tela, t, fases, intensidade, cor_unica=None):
         superficie = pygame.Surface((LARGURA, ALTURA), pygame.SRCALPHA)
@@ -107,12 +114,26 @@ class PainelVisual:
 
         tela.blit(superficie, (0, 0))
 
+    def _desenhar_carregando(self, tela, t):
+        raio_orbita = 22
+        raio_ponto = 6
+        velocidade = 3.0
+        for i in range(NUM_PONTOS_CARREGANDO):
+            fase = i * (2 * math.pi / NUM_PONTOS_CARREGANDO)
+            angulo = t * velocidade + fase
+            x = CENTRO[0] + math.cos(angulo) * raio_orbita
+            y = CENTRO[1] + math.sin(angulo) * raio_orbita
+            tamanho = raio_ponto * (0.4 + 0.6 * ((math.sin(angulo - t * velocidade) + 1) / 2))
+            brilho = 0.3 + 0.7 * (i / NUM_PONTOS_CARREGANDO)
+            cor = tuple(int(c * brilho) for c in COR_CARREGANDO)
+            pygame.draw.circle(tela, cor, (int(x), int(y)), max(1, int(tamanho)))
+
 
 if __name__ == "__main__":
     # teste isolado: alterna estados a cada 3 segundos
     painel = PainelVisual()
     painel.iniciar()
-    estados = ["dormindo", "ouvindo", "falando"]
+    estados = ["dormindo", "ouvindo", "pensando", "falando"]
     i = 0
     while painel._rodando.is_set():
         painel.definir_estado(estados[i % len(estados)])
